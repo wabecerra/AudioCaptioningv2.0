@@ -7,7 +7,11 @@ from torchvision.models.feature_extraction import create_feature_extractor
 from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
-def get_audio_feature_vector(model: nn.Module, img_tensors: torch.Tensor, layer_dict):
+def get_audio_feature_vector(
+    model: nn.Module,
+    img_tensors: torch.Tensor,
+    layer_dict: dict
+) -> torch.Tensor:
     """
     Get feature vectors for the given audio (passed in as a spectrogram image) by returning the output
     of the selected model at an intermediate layer.
@@ -27,16 +31,19 @@ def get_audio_feature_vector(model: nn.Module, img_tensors: torch.Tensor, layer_
     feat_vec - A list of feature vectors for each of the requested layers as tuples in [("name", tensor)] format
 
     """
-    features = []
-    model = create_feature_extractor(model, layer_dict)
+    extractor = create_feature_extractor(model, layer_dict)
     img_tensors = img_tensors.unsqueeze(0)
-    model = model.double()
-    out = model(img_tensors)
+    extractor = extractor.double()
+    out = extractor(img_tensors)
     features = out["features"]
-    features = torch.reshape(features, (features.size()[0], features.size()[1]))
-    return features
+    return features.view(features.size(0), -1)
 
-def get_vit_feature_vector(model: nn.Module, device, img_tensors: torch.Tensor, layer_dict={"encoder.layers.encoder_layer_11.mlp":"features"}):
+def get_vit_feature_vector(
+    model: nn.Module,
+    device: torch.device,
+    img_tensors: torch.Tensor,
+    layer_dict: dict = {"encoder.layers.encoder_layer_11.mlp": "features"}
+) -> torch.Tensor:
     """
     Get feature vectors for the given audio (passed in as a spectrogram image) by returning the output
     of the selected model at an intermediate layer.
@@ -56,63 +63,57 @@ def get_vit_feature_vector(model: nn.Module, device, img_tensors: torch.Tensor, 
     feat_vec - A list of feature vectors for each of the requested layers as tuples in [("name", tensor)] format
 
     """
-    features = None
-    model = create_feature_extractor(model, layer_dict).to(device)
+    extractor = create_feature_extractor(model.to(device), layer_dict)
     img_tensors = img_tensors.unsqueeze(0).to(device)
-    model = model.double()
-    out = model(img_tensors)
-    features = out["features"]
-    features = features[:, 0, :]
-    return features
+    extractor = extractor.double()
+    out = extractor(img_tensors)
+    features = out["features"]  # shape: (batch, seq_len, hidden_dim)
+    # Typically the [CLS] token is at index 0
+    return features[:, 0, :]
 
 
-# Pretrained Audio Neural Networks
-
-def init_layer(layer):
-    """Initialize a Linear or Convolutional layer. """
+def init_layer(layer: nn.Module) -> None:
+    """
+    Initialize a Linear or Convolutional layer using Xavier uniform.
+    """
     nn.init.xavier_uniform_(layer.weight)
- 
-    if hasattr(layer, 'bias'):
-        if layer.bias is not None:
-            layer.bias.data.fill_(0.)
-            
-    
-def init_bn(bn):
-    """Initialize a Batchnorm layer. """
-    bn.bias.data.fill_(0.)
-    bn.weight.data.fill_(1.)
+    if hasattr(layer, 'bias') and layer.bias is not None:
+        layer.bias.data.fill_(0.0)
+
+
+def init_bn(bn: nn.BatchNorm2d) -> None:
+    """
+    Initialize a BatchNorm2d layer with bias=0 and weight=1.
+    """
+    bn.bias.data.fill_(0.0)
+    bn.weight.data.fill_(1.0)
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        
-        super(ConvBlock, self).__init__()
-        
-        self.conv1 = nn.Conv2d(in_channels=in_channels, 
-                              out_channels=out_channels,
-                              kernel_size=(3, 3), stride=(1, 1),
-                              padding=(1, 1), bias=False)
-                              
-        self.conv2 = nn.Conv2d(in_channels=out_channels, 
-                              out_channels=out_channels,
-                              kernel_size=(3, 3), stride=(1, 1),
-                              padding=(1, 1), bias=False)
-                              
+    """
+    A simple two-convolution block with optional average or max pooling.
+    """
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=(3, 3),
+            stride=(1, 1), padding=(1, 1), bias=False
+        )
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=(3, 3),
+            stride=(1, 1), padding=(1, 1), bias=False
+        )
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.bn2 = nn.BatchNorm2d(out_channels)
-
         self.init_weight()
-        
-    def init_weight(self):
+
+    def init_weight(self) -> None:
         init_layer(self.conv1)
         init_layer(self.conv2)
         init_bn(self.bn1)
         init_bn(self.bn2)
 
-        
-    def forward(self, input, pool_size=(2, 2), pool_type='avg'):
-        
-        x = input
+    def forward(self, x: torch.Tensor, pool_size=(2, 2), pool_type='avg') -> torch.Tensor:
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         if pool_type == 'max':
@@ -120,20 +121,19 @@ class ConvBlock(nn.Module):
         elif pool_type == 'avg':
             x = F.avg_pool2d(x, kernel_size=pool_size)
         elif pool_type == 'avg+max':
-            x1 = F.avg_pool2d(x, kernel_size=pool_size)
-            x2 = F.max_pool2d(x, kernel_size=pool_size)
-            x = x1 + x2
+            x = (F.avg_pool2d(x, kernel_size=pool_size) +
+                 F.max_pool2d(x, kernel_size=pool_size))
         else:
-            raise Exception('Incorrect argument!')
-        
+            raise ValueError("Unknown pool_type: {}".format(pool_type))
         return x
 
 
 class Cnn14(nn.Module):
-    def __init__(self, classes_num=527):
-        
-        super(Cnn14, self).__init__()
-
+    """
+    A CNN architecture from PANN (Pretrained Audio Neural Networks).
+    """
+    def __init__(self, classes_num: int = 527):
+        super().__init__()
         self.bn0 = nn.BatchNorm2d(64)
 
         self.conv_block1 = ConvBlock(in_channels=1, out_channels=64)
@@ -142,21 +142,21 @@ class Cnn14(nn.Module):
         self.conv_block4 = ConvBlock(in_channels=256, out_channels=512)
         self.conv_block5 = ConvBlock(in_channels=512, out_channels=1024)
         self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048)
-    
-        
+
         self.init_weight()
 
-    
-    def init_weight(self):
+    def init_weight(self) -> None:
         init_bn(self.bn0)
-      
- 
-    def forward(self, input):
-        """
-        Input: (batch_size, data_length)"""
 
-        # convert x to float
-        x = input.unsqueeze(1).float()
+    def forward(self, input_data: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input_data: (batch_size, time_length) or (batch_size, 1, freq, time)
+                       For PANN, typically (batch_size, 64, time).
+        Returns:
+            A (batch_size, 2048) tensor of extracted features.
+        """
+        x = input_data.unsqueeze(1).float()  # (batch_size, 1, freq, time)
         x = self.conv_block1(x, pool_size=(2, 2), pool_type='avg')
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv_block2(x, pool_size=(2, 2), pool_type='avg')
@@ -169,10 +169,9 @@ class Cnn14(nn.Module):
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv_block6(x, pool_size=(1, 1), pool_type='avg')
         x = F.dropout(x, p=0.2, training=self.training)
-        x = torch.mean(x, dim=3)
-        
-        (x1, _) = torch.max(x, dim=2)
-        x2 = torch.mean(x, dim=2)
-        x = x1 + x2
 
-        return x
+        # Now shape is (batch_size, 2048, freq=1, time=?)
+        x = torch.mean(x, dim=3)  # (batch_size, 2048, freq=1)
+        x1, _ = torch.max(x, dim=2)  # (batch_size, 2048)
+        x2 = torch.mean(x, dim=2)    # (batch_size, 2048)
+        return x1 + x2  # (batch_size, 2048)

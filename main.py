@@ -1,297 +1,278 @@
 import yaml
 import argparse
 import os
-import sys
-import torch.utils.data
 import datetime
-from models.clip import BaseClip, ViTClip, PANNClip
-from torch.utils.data.dataloader import DataLoader
-from dataloaders.clotho_dataloader import AudioCaptioningDataset, get_numpy_from_datadir
-from util.utils import eval_model_embeddings
+import torch
 import torch.optim
+from torch.utils.data.dataloader import DataLoader
+
+# Local imports
+from dataloaders.clotho_dataloader import AudioCaptioningDataset, load_data_from_npy
+from models.clip import BaseClip, ViTClip, PANNClip
+from util.utils import eval_model_embeddings
 import wandb
 
-parser = argparse.ArgumentParser(description="Music caption retrieval project for Georgia Tech CS7643")
+parser = argparse.ArgumentParser(description="Music caption retrieval project")
 parser.add_argument("--config", default="configs/resnet.yaml")
-parser.add_argument("--mode", default="train")
+parser.add_argument("--mode", default="train", choices=["train", "test"])
 
-def set_syspath():
-    sys.path.append(args.sys_path)
-    sys.path.append(args.model_lib_path)
-    print("Current sys.path settings:")
-    print(sys.path)
-    return
-
-def train(get_metrics=False, eval_batch_size = 512, print_every_epoch = 1):
+def set_syspath(sys_path: str, model_lib_path: str):
     """
-    Make predictions on the dataset using the model specified using args.model on Mel-Spectrogram image representations
-    of input audio.
-
-    See the config_format.md file in the configs folder for more setting details.
-
-    Parameters
-    ---
-    get_metrics: boolean
-        Whether to get metrics (MRR, Recall/Precision @ 5) each epoch of training
-
+    If needed, you can dynamically modify sys.path here. 
+    For now, we omit usage if your project is structured as a proper package.
     """
-    config = {"lr": args.lr, "batch_size":args.batch_size, "seed":args.random_seed}
-    
-    wandb.init(project=args.model + "-F22", entity="deep-learning-f22",
-              config=config)
+    pass
+
+def train_model(
+    args,
+    get_metrics: bool = False,
+    eval_batch_size: int = 512,
+    print_every_epoch: int = 1
+):
+    """
+    Train the CLIP-like model on audio-caption data.
+
+    Args:
+        get_metrics (bool): If True, evaluate MRR, MAP@K, and R@K after each epoch.
+        eval_batch_size (int): Batch size for metric evaluation.
+        print_every_epoch (int): Print metrics every n epochs.
+    """
+    config = {"lr": args.lr, "batch_size": args.batch_size, "seed": args.random_seed}
+    wandb.init(project=args.model + "-F22", entity="deep-learning-f22", config=config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model = load_model(args.model, device=device)
-    
-    # Setting the random seed for reproducibility if needed
+
     if args.random_seed is not None:
         torch.manual_seed(args.random_seed)
-    
+
     print(f"Running on device: {device}")
 
-    # Settings to save the model
-    
     model_dir = args.save_dir
     if args.random_seed is not None:
-        model_dir += f"seed_{args.random_seed}_{datetime.date.today():%Y%m%d%H%M%S}"
-    
-    # Check whether the specified path exists or not
-    isExist = os.path.exists(model_dir)
-    if not isExist:
-      # Create a new directory because it does not exist
-      os.makedirs(model_dir)
+        model_dir += f"seed_{args.random_seed}_{datetime.datetime.now():%Y%m%d%H%M%S}"
 
-    epochs = args.epochs
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr =args.lr, weight_decay=0.)
-    
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=1.0, factor=0.8)
+        optimizer, mode="min", patience=1, factor=0.8
+    )
 
-    # Create train and validation dataloaders
     print("Creating dataloaders...")
-    data_train = get_numpy_from_datadir(args.data_dir, 'train/val')
+    data_train = load_data_from_npy(args.data_dir, 'train/val')
 
     if args.model == 'PANN':
-      train_dataset = AudioCaptioningDataset(data_train['train_spectrograms'], data_train['train_captions'], augment = True)
-      val_dataset = AudioCaptioningDataset(data_train['val_spectrograms'], data_train['val_captions'])
+        train_dataset = AudioCaptioningDataset(
+            data_train['train_spectrograms'], data_train['train_captions'], augment=True
+        )
+        val_dataset = AudioCaptioningDataset(
+            data_train['val_spectrograms'], data_train['val_captions']
+        )
     else:
-      train_dataset = AudioCaptioningDataset(data_train['train_spectrograms'], data_train['train_captions'], augment = True, multichannel = True)
-      val_dataset = AudioCaptioningDataset(data_train['val_spectrograms'], data_train['val_captions'], multichannel = True)
+        train_dataset = AudioCaptioningDataset(
+            data_train['train_spectrograms'], data_train['train_captions'],
+            augment=True, multichannel=True
+        )
+        val_dataset = AudioCaptioningDataset(
+            data_train['val_spectrograms'], data_train['val_captions'], multichannel=True
+        )
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    train_dataloader_metrics = DataLoader(train_dataset, batch_size=eval_batch_size, shuffle=True)
-    val_dataloader_metrics = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=True)
+    train_dataloader_metrics = DataLoader(train_dataset, batch_size=eval_batch_size, shuffle=False)
+    val_dataloader_metrics = DataLoader(val_dataset, batch_size=eval_batch_size, shuffle=False)
 
-    min_val_loss = float("inf")
+    min_val_loss = float('inf')
 
-    # Training and Validation
     print("Starting training!")
-    
-    for e in range(epochs):
+    for e in range(args.epochs):
         start = datetime.datetime.now()
-        print(f"Beginning epoch {e+1} at {start}.")
-        # Training loss
-        train_total_loss = 0
-        # Set model in train mode
+        print(f"Beginning epoch {e+1} at {start}")
         model.train()
-        # Loop over train data loader
-        for (idx,batch) in enumerate(train_dataloader):
-            if idx % 10 == 0:
-                batch_time = datetime.datetime.now()
-                print(f"Training batch {idx+1} processed at: {batch_time}")
 
-            # Send to device
+        train_total_loss = 0.0
+        for idx, batch in enumerate(train_dataloader):
+            if idx % 10 == 0:
+                print(f"Training batch {idx+1} at {datetime.datetime.now()}")
+
             batch = (batch[0].to(device), batch[1].to(device), batch[2].to(device))
-            # Forward pass
-            batch_loss, audio_encoders, text_encoders = model.forward(batch)
-            # Backward pass
+            batch_loss, _, _ = model(batch)
+
             optimizer.zero_grad()
             batch_loss.backward()
-            # Optimizer step
             optimizer.step()
-            lr_scheduler.step(metrics=batch_loss)
-            # Accumulating gradient
+            lr_scheduler.step(batch_loss)
+
             train_total_loss += batch_loss.item()
-        
-        # Logs to wandb every iteration
-        print('Training Loss:', train_total_loss/len(train_dataloader))
-        wandb.log({'Training Loss': train_total_loss/len(train_dataloader)})
-        # Saving model
-        save_filename = model_dir + f"/model_{e+1}.pth"
-        if get_metrics == True:
-            # Training metrics evaluation       
+
+        avg_train_loss = train_total_loss / len(train_dataloader)
+        print(f"Training Loss: {avg_train_loss:.4f}")
+        wandb.log({'Training Loss': avg_train_loss})
+
+        # Evaluate on training set
+        if get_metrics:
             train_metrics = evaluate(model, train_dataloader_metrics, "train")
-            # Logs to wandb
-            wandb.log({'train MRR': train_metrics["train_MRR"], 
-                       'train MAP@K': train_metrics['train_MAP@K'], 
-                       'train R@K': train_metrics['train_R@K']})
-            # Print metrics to terminal
-            if (e+1) % print_every_epoch == 0 or ((e+1) == epochs):
-                    print ('Training Metrics. Epoch: [{}/{}], MRR: {:.4f}, MAP@K: {:.4f}, R@K: {:.4f}' 
-                          .format(e + 1, epochs, 
-                                  train_metrics["train_MRR"], 
-                                  train_metrics["train_MAP@K"],
-                                  train_metrics["train_R@K"]))
-            # Saving metrics for train split
-            train_metrics_fp = model_dir + "/train_metrics.txt"
-            print(f"Saving final training metrics to: {train_metrics_fp}")
-            with open(train_metrics_fp, "w+") as f:
-                for k in train_metrics.keys():
-                    f.write(k + ": " + f"{train_metrics[k]}\n")
+            wandb.log({
+                'train MRR': train_metrics["train_MRR"],
+                'train MAP@K': train_metrics["train_MAP@K"],
+                'train R@K': train_metrics["train_R@K"]
+            })
+            if (e + 1) % print_every_epoch == 0 or (e + 1) == args.epochs:
+                print(
+                    "Train Metrics [Epoch {}/{}]: MRR={:.4f}, MAP@K={:.4f}, R@K={:.4f}".format(
+                        e+1, args.epochs,
+                        train_metrics["train_MRR"],
+                        train_metrics["train_MAP@K"],
+                        train_metrics["train_R@K"]
+                    )
+                )
+            with open(os.path.join(model_dir, "train_metrics.txt"), "w") as f:
+                for k, v in train_metrics.items():
+                    f.write(f"{k}: {v}\n")
 
-        # Set model in evaluation mode
+        # Validation step
         model.eval()
-        # Total val loss
-        val_total_loss = 0
-        # Validation loop
-        for (idx,batch) in enumerate(val_dataloader):
-            # Printing eval batch 
-            if idx % 10 == 0:
-                batch_time = datetime.datetime.now()
-                print(f"Eval batch {idx+1} processed at: {batch_time}")
-            # Forward pass and loss calculation
-            batch = (batch[0].to(device), batch[1].to(device), batch[2].to(device))
-            batch_loss, _, __ = model.forward(batch)
-            val_total_loss += batch_loss.item()
-        # Logging the loss
-        print('Validation Loss:', val_total_loss/len(val_dataloader))
-        wandb.log({'Validation Loss': val_total_loss/len(val_dataloader)})  
+        val_total_loss = 0.0
+        with torch.no_grad():
+            for idx, batch in enumerate(val_dataloader):
+                if idx % 10 == 0:
+                    print(f"Validation batch {idx+1} at {datetime.datetime.now()}")
+                batch = (batch[0].to(device), batch[1].to(device), batch[2].to(device))
+                batch_loss, _, _ = model(batch)
+                val_total_loss += batch_loss.item()
 
-        if get_metrics == True:
-            # Val metrics evaluation       
+        avg_val_loss = val_total_loss / len(val_dataloader)
+        print(f"Validation Loss: {avg_val_loss:.4f}")
+        wandb.log({'Validation Loss': avg_val_loss})
+
+        if get_metrics:
             val_metrics = evaluate(model, val_dataloader_metrics, "val")
-            # Logs to wandb
-            wandb.log({'val MRR': val_metrics["val_MRR"], 
-                       'val MAP@K': val_metrics['val_MAP@K'], 
-                       'val R@K': val_metrics['val_R@K']})
-            # Print metrics to terminal
-            if (e+1) % print_every_epoch == 0 or ((e+1) == epochs):
-              print ('Validation Metrics. Epoch: [{}/{}], MRR: {:.4f}, MAP@K: {:.4f}, R@K: {:.4f}' 
-                    .format(e + 1, epochs, 
-                            val_metrics["val_MRR"], 
-                            val_metrics["val_MAP@K"],
-                            val_metrics["val_R@K"]))
-            # Saving metrics for val split
-            val_metrics_fp = model_dir + "/val_metrics.txt"
-            print(f"Saving final validation metrics to: {val_metrics_fp}")
-            with open(val_metrics_fp, "w+") as f:
-                for k in val_metrics.keys():
-                    f.write(k + ": " + f"{val_metrics[k]}\n")
+            wandb.log({
+                'val MRR': val_metrics["val_MRR"],
+                'val MAP@K': val_metrics["val_MAP@K"],
+                'val R@K': val_metrics["val_R@K"]
+            })
+            if (e + 1) % print_every_epoch == 0 or (e + 1) == args.epochs:
+                print(
+                    "Val Metrics [Epoch {}/{}]: MRR={:.4f}, MAP@K={:.4f}, R@K={:.4f}".format(
+                        e+1, args.epochs,
+                        val_metrics["val_MRR"],
+                        val_metrics["val_MAP@K"],
+                        val_metrics["val_R@K"]
+                    )
+                )
+            with open(os.path.join(model_dir, "val_metrics.txt"), "w") as f:
+                for k, v in val_metrics.items():
+                    f.write(f"{k}: {v}\n")
 
-        # If new loss is better than previous best, saves the model
-        if val_total_loss < min_val_loss:
-            print("Saving...")
+        # Save best model
+        if avg_val_loss < min_val_loss:
+            print("New best model found. Saving...")
+            save_filename = os.path.join(model_dir, f"model_{e+1}.pth")
             torch.save(model.state_dict(), save_filename)
-            print('Saved as %s' % save_filename)  
-            min_val_loss = val_total_loss
+            print(f"Saved model checkpoint to {save_filename}")
+            min_val_loss = avg_val_loss
 
-    return
 
-def evaluate(model, dataloader, stage = 'train'):
-    # Set the model in eval mode
-    model.eval()
-
-    # Use the GPU if we can
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    print(f"Using device {device} for model evaluation.")    
-    metrics = eval_model_embeddings(model, device, dataloader, ["MRR", "MAP@K", "R@K"], k=10)
-
-    for k in metrics.keys():
-      metrics[stage+'_'+k] = metrics.pop(k)
-
-    if stage != 'test':
-      wandb.log({stage+' MRR': metrics[stage+"_MRR"], 
-                  stage+' MAP@K': metrics[stage+'_MAP@K'], 
-                  stage+' R@K': metrics[stage+'_R@K']})
-    
-    return metrics
-
-def load_model(model_type, device, state_dict=None):
+def evaluate(model: torch.nn.Module, data_loader: DataLoader, stage: str = 'train'):
     """
-    Load a specified model with newly initialized weights or with a model
-    state loaded from a state dict at the specified file path.
-    """
+    Evaluate a model on a given DataLoader and return the 
+    standard metrics (MRR, MAP@K, R@K).
 
-    # Creates a version of a Clip depending on model type
-    model = None
+    Args:
+        model (nn.Module): The model to evaluate.
+        data_loader (DataLoader): The data loader to evaluate on.
+        stage (str): 'train', 'val', or 'test'.
+    
+    Returns:
+        dict: {f"{stage}_MRR", f"{stage}_MAP@K", f"{stage}_R@K"}
+    """
+    device = next(model.parameters()).device
+    metrics = eval_model_embeddings(model, device, data_loader, ["MRR", "MAP@K", "R@K"], k=10)
+
+    # rename metrics keys
+    stage_metrics = {}
+    for k, v in metrics.items():
+        stage_metrics[f"{stage}_{k}"] = v
+    return stage_metrics
+
+
+def load_model(model_type: str, device: torch.device, state_dict: str = None) -> torch.nn.Module:
+    """
+    Instantiate and optionally load a model checkpoint.
+
+    Args:
+        model_type (str): 'ResNet', 'ViT', or 'PANN'.
+        device (torch.device): CPU or GPU device.
+        state_dict (str): Path to a checkpoint file, if any.
+
+    Returns:
+        nn.Module: The instantiated (and optionally loaded) model.
+    """
     if model_type == "ResNet":
         model = BaseClip(device=device, fine_tune=args.fine_tune)
     elif model_type == "ViT":
         model = ViTClip(device=device, fine_tune=args.fine_tune)
     elif model_type == "PANN":
         model = PANNClip(device=device, fine_tune=args.fine_tune)
-    
-    # Loads the state dict for the model if exists
-    if state_dict != None:
-        if device.type != "cuda":
-            model.load_state_dict(torch.load(state_dict, map_location=torch.device("cpu")))
-        else:
-            model.load_state_dict(torch.load(state_dict))
+    else:
+        raise ValueError("Unknown model type. Choose from [ResNet, ViT, PANN].")
+
+    if state_dict is not None:
+        loaded_dict = torch.load(state_dict, map_location=device)
+        model.load_state_dict(loaded_dict)
 
     return model
 
-def main():
 
-    # Use a config file to make sure we perform the correct experimental setup
+def main():
     global args
     args = parser.parse_args()
-    print(args)
-
     with open(args.config) as f:
         config = yaml.load(f, Loader=yaml.Loader)
-    
+
     for key in config:
         for k, v in config[key].items():
             setattr(args, k, v)
-    
-    # Setting the sys.path variable so we can find our models' Python modules
-    set_syspath()
 
-    # Make predictions using the appropriate method for the selected model
+    # If you need to modify sys.path for custom imports:
+    # set_syspath(args.sys_path, args.model_lib_path)
+
     if args.mode == "train":
-      # Starts training
-      train(get_metrics=args.get_metrics, eval_batch_size = 512, print_every_epoch = 1)
-    
-    if args.mode == "test":
-      # Eval batch_size
-      eval_batch_size = 32
+        train_model(get_metrics=args.get_metrics, eval_batch_size=512, print_every_epoch=1)
+    elif args.mode == "test":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = load_model(args.model, device, args.checkpoint_path)
 
-      # Checks device
-      device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        data_test = load_data_from_npy(args.data_dir, 'test')
+        if args.model == 'PANN':
+            test_dataset = AudioCaptioningDataset(
+                data_test['test_spectrograms'], data_test['test_captions']
+            )
+        else:
+            test_dataset = AudioCaptioningDataset(
+                data_test['test_spectrograms'], data_test['test_captions'],
+                multichannel=True
+            )
 
-      # Loads model
-      model = load_model(args.model, device, args.checkpoint_path)
+        test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        test_metrics = evaluate(model, test_dataloader, stage="test")
 
-      # Loads data set and data loader
-      data_test = get_numpy_from_datadir(args.data_dir, 'test')
-      if args.model == 'PANN':
-        test_dataset = AudioCaptioningDataset(data_test['test_spectrograms'], data_test['test_captions'])
-      else:
-        test_dataset = AudioCaptioningDataset(data_test['test_spectrograms'], data_test['test_captions'], multichannel = True)
-      test_dataloader = DataLoader(test_dataset, batch_size=eval_batch_size, shuffle=False)
+        save_path = os.path.join(args.save_dir, f"{args.model}_test_metrics.txt")
+        print(
+            "Test Metrics: MRR={:.4f}, MAP@K={:.4f}, R@K={:.4f}".format(
+                test_metrics["test_MRR"],
+                test_metrics["test_MAP@K"],
+                test_metrics["test_R@K"]
+            )
+        )
+        with open(save_path, "w") as f:
+            for k, v in test_metrics.items():
+                f.write(f"{k}: {v}\n")
 
-      # Evaluates metrics for data loader
-      test_metrics = evaluate(model, test_dataloader, stage="test")
-      test_metrics_fp = args.save_dir + "/{args.model}_test_metrics.txt"
-
-      # Prints metrics:
-      print ('Test Metrics. MRR: {:.4f}, MAP@K: {:.4f}, R@K: {:.4f}' 
-            .format(test_metrics["test_MRR"], 
-                    test_metrics["test_MAP@K"],
-                    test_metrics["test_R@K"]))
-
-      # Writing metrics
-      with open(test_metrics_fp, "w+") as f:
-          for k in test_metrics.keys():
-              f.write(k + ": " + f"{test_metrics[k]}\n")
-    
-    return
-        
 
 if __name__ == "__main__":
-    main()    
+    main()
